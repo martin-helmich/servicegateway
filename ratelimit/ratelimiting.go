@@ -42,6 +42,16 @@ type RateLimitingMiddleware interface {
 	DecorateHandler(handler httprouter.Handle) httprouter.Handle
 }
 
+type CompositeRateLimitingMiddleware struct {
+	logger *logging.Logger
+	throttler RateThrottler
+}
+
+type RateThrottler interface {
+	init() error
+	takeToken(user string) (int, int, error)
+}
+
 type RedisSimpleRateThrottler struct {
 	burstSize         int64
 	window            time.Duration
@@ -65,10 +75,18 @@ func NewRateLimiter(cfg config.RateLimiting, red *redis.Pool, logger *logging.Lo
 
 	logger.Infof("Initialize rate limiter (burst size %d)", t.burstSize)
 
-	return t, nil
+	err := t.init()
+	if err != nil {
+		return nil, err
+	}
+
+	return &CompositeRateLimitingMiddleware{
+		throttler: t,
+		logger: logger,
+	}, nil
 }
 
-func (t *RedisSimpleRateThrottler) identifyClient(req *http.Request) string {
+func (t *CompositeRateLimitingMiddleware) identifyClient(req *http.Request) string {
 	auth := req.Header.Get("Authorization")
 	if auth != "" {
 		return strings.Replace(auth, " ", "", -1)
@@ -76,6 +94,10 @@ func (t *RedisSimpleRateThrottler) identifyClient(req *http.Request) string {
 
 	addr, _ := net.ResolveTCPAddr("tcp", req.RemoteAddr)
 	return addr.IP.String()
+}
+
+func (t *RedisSimpleRateThrottler) init() error {
+	return nil
 }
 
 func (t *RedisSimpleRateThrottler) takeToken(user string) (int, int, error) {
@@ -130,10 +152,10 @@ func (t *RedisSimpleRateThrottler) takeToken(user string) (int, int, error) {
 //	}
 //}
 
-func (t *RedisSimpleRateThrottler) DecorateHandler(handler httprouter.Handle) httprouter.Handle {
+func (t *CompositeRateLimitingMiddleware) DecorateHandler(handler httprouter.Handle) httprouter.Handle {
 	return func(rw http.ResponseWriter, req *http.Request, p httprouter.Params) {
 		user := t.identifyClient(req)
-		remaining, limit, err := t.takeToken(user)
+		remaining, limit, err := t.throttler.takeToken(user)
 
 		if err != nil {
 			t.logger.Errorf("Error occurred while handling request from %s: %s", req.RemoteAddr, err)
